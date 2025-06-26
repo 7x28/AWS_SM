@@ -83,45 +83,172 @@ locals {
 }
 
 # ==============================================================================
+# IAM ポリシードキュメント (Data Sources)
+# ==============================================================================
+
+# KMS キー用ポリシー
+data "aws_iam_policy_document" "kms_secrets_manager" {
+  statement {
+    sid    = "EnableIAMUserPermissions"
+    effect = "Allow"
+    
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+  
+  statement {
+    sid    = "AllowSecretsManagerToUseTheKey"
+    effect = "Allow"
+    
+    principals {
+      type        = "Service"
+      identifiers = ["secretsmanager.amazonaws.com"]
+    }
+    
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey",
+      "kms:CreateGrant"
+    ]
+    
+    resources = ["*"]
+    
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["secretsmanager.${var.aws_region}.amazonaws.com"]
+    }
+  }
+}
+
+# アプリケーション用 assume role ポリシー
+data "aws_iam_policy_document" "application_assume_role" {
+  statement {
+    effect = "Allow"
+    
+    principals {
+      type = "Service"
+      identifiers = [
+        "ec2.amazonaws.com",
+        "ecs-tasks.amazonaws.com",
+        "lambda.amazonaws.com"
+      ]
+    }
+    
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+# Secrets Manager アクセス用ポリシー
+data "aws_iam_policy_document" "secrets_access" {
+  statement {
+    effect = "Allow"
+    
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:BatchGetSecretValue"
+    ]
+    
+    resources = [
+      for secret in aws_secretsmanager_secret.secrets : secret.arn
+    ]
+  }
+  
+  statement {
+    effect = "Allow"
+    
+    actions = [
+      "kms:Decrypt",
+      "kms:GenerateDataKey"
+    ]
+    
+    resources = [
+      aws_kms_key.secrets_manager.arn
+    ]
+    
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["secretsmanager.${var.aws_region}.amazonaws.com"]
+    }
+  }
+}
+
+# Secrets Manager 管理用ポリシー
+data "aws_iam_policy_document" "secrets_management" {
+  statement {
+    effect = "Allow"
+    
+    actions = ["secretsmanager:*"]
+    
+    resources = [
+      for secret in aws_secretsmanager_secret.secrets : secret.arn
+    ]
+  }
+  
+  statement {
+    effect = "Allow"
+    
+    actions = ["secretsmanager:ListSecrets"]
+    
+    resources = ["*"]
+  }
+  
+  statement {
+    effect = "Allow"
+    
+    actions = [
+      "kms:Encrypt",
+      "kms:Decrypt",
+      "kms:ReEncrypt*",
+      "kms:GenerateDataKey*",
+      "kms:DescribeKey"
+    ]
+    
+    resources = [
+      aws_kms_key.secrets_manager.arn
+    ]
+  }
+}
+
+# クロスアカウントアクセス用ポリシー
+data "aws_iam_policy_document" "cross_account_access" {
+  count = length(var.trusted_accounts) > 0 ? 1 : 0
+  
+  statement {
+    sid    = "AllowTrustedAccountsAccess"
+    effect = "Allow"
+    
+    principals {
+      type = "AWS"
+      identifiers = [
+        for account_id in var.trusted_accounts : 
+        "arn:aws:iam::${account_id}:root"
+      ]
+    }
+    
+    actions = [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:BatchGetSecretValue"
+    ]
+    
+    resources = ["*"]
+  }
+}
+
+# ==============================================================================
 # KMS キー (シークレット暗号化用)
 # ==============================================================================
 
 resource "aws_kms_key" "secrets_manager" {
   description             = "KMS key for Secrets Manager encryption"
   deletion_window_in_days = 7
-  
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "Enable IAM User Permissions"
-        Effect = "Allow"
-        Principal = {
-          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
-        }
-        Action   = "kms:*"
-        Resource = "*"
-      },
-      {
-        Sid    = "Allow Secrets Manager to use the key"
-        Effect = "Allow"
-        Principal = {
-          Service = "secretsmanager.amazonaws.com"
-        }
-        Action = [
-          "kms:Decrypt",
-          "kms:GenerateDataKey",
-          "kms:CreateGrant"
-        ]
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "kms:ViaService" = "secretsmanager.${var.aws_region}.amazonaws.com"
-          }
-        }
-      }
-    ]
-  })
+  policy                  = data.aws_iam_policy_document.kms_secrets_manager.json
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-secrets-kms-key"
@@ -159,24 +286,8 @@ resource "aws_secretsmanager_secret" "secrets" {
 
 # アプリケーション用IAMロール
 resource "aws_iam_role" "application" {
-  name = "${local.name_prefix}-application-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = [
-            "ec2.amazonaws.com",
-            "ecs-tasks.amazonaws.com",
-            "lambda.amazonaws.com"
-          ]
-        }
-      }
-    ]
-  })
+  name               = "${local.name_prefix}-application-role"
+  assume_role_policy = data.aws_iam_policy_document.application_assume_role.json
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-application-role"
@@ -187,37 +298,7 @@ resource "aws_iam_role" "application" {
 resource "aws_iam_policy" "secrets_access" {
   name        = "${local.name_prefix}-secrets-access-policy"
   description = "Policy for accessing Secrets Manager secrets"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:BatchGetSecretValue"
-        ]
-        Resource = [
-          for secret in aws_secretsmanager_secret.secrets : secret.arn
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "kms:Decrypt",
-          "kms:GenerateDataKey"
-        ]
-        Resource = [
-          aws_kms_key.secrets_manager.arn
-        ]
-        Condition = {
-          StringEquals = {
-            "kms:ViaService" = "secretsmanager.${var.aws_region}.amazonaws.com"
-          }
-        }
-      }
-    ]
-  })
+  policy      = data.aws_iam_policy_document.secrets_access.json
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-secrets-access-policy"
@@ -253,41 +334,7 @@ resource "aws_iam_group" "secrets_managers" {
 resource "aws_iam_policy" "secrets_management" {
   name        = "${local.name_prefix}-secrets-management-policy"
   description = "Policy for managing Secrets Manager secrets"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:*"
-        ]
-        Resource = [
-          for secret in aws_secretsmanager_secret.secrets : secret.arn
-        ]
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "secretsmanager:ListSecrets"
-        ]
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "kms:Encrypt",
-          "kms:Decrypt",
-          "kms:ReEncrypt*",
-          "kms:GenerateDataKey*",
-          "kms:DescribeKey"
-        ]
-        Resource = [
-          aws_kms_key.secrets_manager.arn
-        ]
-      }
-    ]
-  })
+  policy      = data.aws_iam_policy_document.secrets_management.json
 
   tags = merge(local.common_tags, {
     Name = "${local.name_prefix}-secrets-management-policy"
@@ -309,27 +356,7 @@ resource "aws_secretsmanager_secret_policy" "cross_account" {
   for_each = length(var.trusted_accounts) > 0 ? { for secret in var.secrets_list : secret.name => secret } : {}
 
   secret_arn = aws_secretsmanager_secret.secrets[each.key].arn
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowTrustedAccountsAccess"
-        Effect = "Allow"
-        Principal = {
-          AWS = [
-            for account_id in var.trusted_accounts : 
-            "arn:aws:iam::${account_id}:root"
-          ]
-        }
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:BatchGetSecretValue"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
+  policy     = data.aws_iam_policy_document.cross_account_access[0].json
 }
 
 # ==============================================================================
